@@ -26,8 +26,8 @@ export default function LandingPage() {
         const blob = await sampleFile(file, setStatus);
         setStatus("Uploading...");
         const res = await uploadFile(blob, file.name);
-        sessionStorage.setItem(`session_${res.session_id}`, JSON.stringify(res));
-        router.push(`/upload?session=${res.session_id}`);
+        sessionStorage.setItem(`workspace_${res.workspace_id}`, JSON.stringify(res));
+        router.push(`/upload?workspace=${res.workspace_id}&dataset=${res.dataset_id}`);
       } catch (err) {
         setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`);
         setLoading(false);

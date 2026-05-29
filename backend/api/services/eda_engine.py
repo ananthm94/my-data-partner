@@ -139,8 +139,26 @@ def get_column_profile(df: pd.DataFrame, column: str) -> dict[str, Any]:
 
     if col_type in ("numeric", "numeric_category"):
         numeric = pd.to_numeric(series, errors="coerce").dropna()
-        bins = min(40, max(5, int(len(numeric) ** 0.5)))
-        counts, edges = np.histogram(numeric, bins=bins)
+        unique_vals = numeric.unique()
+        is_discrete = (
+            len(unique_vals) <= 50
+            and len(numeric) > 0
+            and bool(np.all(np.abs(numeric - np.round(numeric)) < 1e-9))
+        )
+        if is_discrete:
+            vc = numeric.round().astype(int).value_counts().sort_index()
+            base["distribution_data"] = [
+                {"bin_start": int(k), "bin_end": int(k), "count": int(v)}
+                for k, v in vc.items()
+            ]
+        else:
+            bins = min(40, max(5, int(len(numeric) ** 0.5)))
+            counts, edges = np.histogram(numeric, bins=bins)
+            base["distribution_data"] = [
+                {"bin_start": _jv(float(edges[i])), "bin_end": _jv(float(edges[i + 1])), "count": int(counts[i])}
+                for i in range(len(counts))
+            ]
+        base["is_discrete"] = is_discrete
         base["stats"] = {
             "min": _jv(numeric.min()),
             "max": _jv(numeric.max()),
@@ -152,20 +170,19 @@ def get_column_profile(df: pd.DataFrame, column: str) -> dict[str, Any]:
             "median": _jv(round(float(numeric.median()), 4)),
             "q3": _jv(round(float(numeric.quantile(0.75)), 4)),
         }
-        base["distribution_data"] = [
-            {"bin_start": _jv(float(edges[i])), "bin_end": _jv(float(edges[i + 1])), "count": int(counts[i])}
-            for i in range(len(counts))
-        ]
+        base["outlier_stats"] = _compute_outlier_stats(numeric)
 
     elif col_type == "datetime":
         dt = pd.to_datetime(series, errors="coerce").dropna()
-        freq = _datetime_frequency(dt)
         base["stats"] = {
             "min": dt.min().isoformat() if not dt.empty else None,
             "max": dt.max().isoformat() if not dt.empty else None,
             "span_days": _jv((dt.max() - dt.min()).days) if not dt.empty else None,
         }
-        base["frequency_data"] = freq
+        base["frequency_data"] = _datetime_frequency(dt, "day")
+        base["frequency_data_weekly"] = _datetime_frequency(dt, "week")
+        base["frequency_data_monthly"] = _datetime_frequency(dt, "month")
+        base["outlier_stats"] = _compute_date_outlier_stats(dt)
 
     elif col_type in ("categorical", "boolean"):
         counts = series.dropna().astype(str).value_counts()
@@ -193,34 +210,72 @@ def get_column_profile(df: pd.DataFrame, column: str) -> dict[str, Any]:
     return base
 
 
-def _datetime_frequency(dt: pd.Series) -> list[dict[str, Any]]:
+def _datetime_frequency(dt: pd.Series, grain: str = "day") -> list[dict[str, Any]]:
     if dt.empty:
         return []
-    grain = _infer_grain(dt)
-    if grain == "month":
-        bucketed = dt.dt.to_period("M").astype(str)
-    elif grain == "week":
-        bucketed = dt.dt.to_period("W").astype(str)
-    elif grain == "year":
-        bucketed = dt.dt.to_period("Y").astype(str)
-    else:
-        bucketed = dt.dt.floor("D").astype(str)
-    counts = bucketed.value_counts().sort_index().head(200)
+    period_map = {"day": "D", "week": "W", "month": "M"}
+    period_freq = period_map.get(grain, "D")
+    bucketed = dt.dt.to_period(period_freq)
+    counts = bucketed.value_counts().sort_index()
     return [{"bucket": str(k), "count": int(v)} for k, v in counts.items()]
 
 
-def _infer_grain(dt: pd.Series) -> str:
-    diffs = dt.sort_values().drop_duplicates().diff().dropna().dt.total_seconds()
-    if diffs.empty:
-        return "day"
-    med = diffs.median()
-    if med <= 86_400:
-        return "day"
-    if med <= 604_800:
-        return "week"
-    if med <= 2_678_400:
-        return "month"
-    return "year"
+def _compute_outlier_stats(series: pd.Series) -> dict[str, Any]:
+    clean = series.dropna()
+    if len(clean) < 4:
+        return {}
+    q1 = float(clean.quantile(0.25))
+    q3 = float(clean.quantile(0.75))
+    iqr = q3 - q1
+    iqr_lower = q1 - 1.5 * iqr
+    iqr_upper = q3 + 1.5 * iqr
+    outlier_mask = (clean < iqr_lower) | (clean > iqr_upper)
+    iqr_outlier_count = int(outlier_mask.sum())
+    outlier_values = [_jv(float(v)) for v in clean[outlier_mask].head(50).tolist()]
+    mean_val = float(clean.mean())
+    std_val = float(clean.std(ddof=0))
+    zscore_outlier_count = 0
+    if std_val > 0:
+        z_scores = (clean - mean_val) / std_val
+        zscore_outlier_count = int((z_scores.abs() > 3.0).sum())
+    negative_count = int((clean < 0).sum())
+    return {
+        "iqr_lower": round(iqr_lower, 4),
+        "iqr_upper": round(iqr_upper, 4),
+        "iqr_outlier_count": iqr_outlier_count,
+        "zscore_outlier_count": zscore_outlier_count,
+        "zscore_threshold": 3.0,
+        "negative_count": negative_count,
+        "outlier_values": outlier_values,
+    }
+
+
+def _compute_date_outlier_stats(dt: pd.Series) -> dict[str, Any]:
+    if len(dt) < 4:
+        return {}
+    try:
+        dt_utc = dt.dt.tz_convert(None) if (hasattr(dt.dt, "tz") and dt.dt.tz is not None) else dt
+        ts = dt_utc.astype("int64")  # nanoseconds since epoch
+    except (TypeError, ValueError, AttributeError):
+        return {}
+    q1_ts = float(ts.quantile(0.25))
+    q3_ts = float(ts.quantile(0.75))
+    iqr_ts = q3_ts - q1_ts
+    if iqr_ts == 0:
+        return {"iqr_outlier_count": 0, "iqr_lower_date": None, "iqr_upper_date": None}
+    lower = q1_ts - 1.5 * iqr_ts
+    upper = q3_ts + 1.5 * iqr_ts
+    outlier_count = int(((ts < lower) | (ts > upper)).sum())
+    try:
+        lower_dt = pd.Timestamp(int(lower)).isoformat()
+        upper_dt = pd.Timestamp(int(upper)).isoformat()
+    except (OverflowError, ValueError, OSError):
+        lower_dt, upper_dt = None, None
+    return {
+        "iqr_outlier_count": outlier_count,
+        "iqr_lower_date": lower_dt,
+        "iqr_upper_date": upper_dt,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +287,22 @@ def get_relationship(df: pd.DataFrame, x_col: str, y_col: str) -> dict[str, Any]
         if c not in df.columns:
             raise ValueError(f"Column not found: {c}")
 
+    x_type = infer_type(df[x_col])
+    y_type = infer_type(df[y_col])
+    x_is_num = x_type in ("numeric", "numeric_category")
+    y_is_num = y_type in ("numeric", "numeric_category")
+
+    if x_is_num and y_is_num:
+        return _rel_cont_cont(df, x_col, y_col)
+    elif not x_is_num and y_is_num:
+        return _rel_cat_cont(df, x_col, y_col)
+    elif x_is_num and not y_is_num:
+        return _rel_cat_cont(df, y_col, x_col)
+    else:
+        return _rel_cat_cat(df, x_col, y_col)
+
+
+def _rel_cont_cont(df: pd.DataFrame, x_col: str, y_col: str) -> dict[str, Any]:
     x = pd.to_numeric(df[x_col], errors="coerce")
     y = pd.to_numeric(df[y_col], errors="coerce")
     mask = x.notna() & y.notna()
@@ -240,7 +311,7 @@ def get_relationship(df: pd.DataFrame, x_col: str, y_col: str) -> dict[str, Any]
     if len(x_clean) < 3:
         raise ValueError("Not enough numeric data to compute relationship.")
 
-    pearson_r, pearson_p = stats.pearsonr(x_clean, y_clean)
+    pearson_r, _ = stats.pearsonr(x_clean, y_clean)
     spearman_r, _ = stats.spearmanr(x_clean, y_clean)
     slope, intercept, r_value, p_value, _ = stats.linregress(x_clean, y_clean)
 
@@ -252,17 +323,77 @@ def get_relationship(df: pd.DataFrame, x_col: str, y_col: str) -> dict[str, Any]
     ]
 
     return {
-        "correlation": {
-            "pearson": round(float(pearson_r), 4),
-            "spearman": round(float(spearman_r), 4),
-        },
-        "regression": {
-            "slope": round(float(slope), 4),
-            "intercept": round(float(intercept), 4),
-            "r_squared": round(float(r_value ** 2), 4),
-            "p_value": round(float(p_value), 6),
-        },
+        "analysis_type": "cont_cont",
+        "correlation": {"pearson": round(float(pearson_r), 4), "spearman": round(float(spearman_r), 4)},
+        "regression": {"slope": round(float(slope), 4), "intercept": round(float(intercept), 4), "r_squared": round(float(r_value ** 2), 4), "p_value": round(float(p_value), 6)},
         "scatter_data": scatter_data,
+        "box_data": None,
+        "crosstab_data": None,
+        "crosstab_columns": None,
+    }
+
+
+def _rel_cat_cont(df: pd.DataFrame, cat_col: str, num_col: str) -> dict[str, Any]:
+    num = pd.to_numeric(df[num_col], errors="coerce")
+    mask = df[cat_col].notna() & num.notna()
+    cat_series = df[cat_col].astype(str)
+    top_cats = cat_series[mask].value_counts().head(10).index.tolist()
+
+    box_data = []
+    for cat_val in top_cats:
+        cat_mask = mask & (cat_series == cat_val)
+        values = num[cat_mask].dropna()
+        if len(values) < 3:
+            continue
+        q1 = float(values.quantile(0.25))
+        q3 = float(values.quantile(0.75))
+        iqr = q3 - q1
+        w_low = float(values[values >= q1 - 1.5 * iqr].min())
+        w_high = float(values[values <= q3 + 1.5 * iqr].max())
+        outliers = [_jv(float(v)) for v in values[(values < w_low) | (values > w_high)].head(30).tolist()]
+        box_data.append({
+            "category": cat_val,
+            "q1": round(q1, 4),
+            "median": round(float(values.median()), 4),
+            "q3": round(q3, 4),
+            "whisker_low": round(w_low, 4),
+            "whisker_high": round(w_high, 4),
+            "outliers": outliers,
+        })
+
+    return {
+        "analysis_type": "cat_cont",
+        "correlation": None,
+        "regression": None,
+        "scatter_data": None,
+        "box_data": box_data,
+        "crosstab_data": None,
+        "crosstab_columns": None,
+    }
+
+
+def _rel_cat_cat(df: pd.DataFrame, x_col: str, y_col: str) -> dict[str, Any]:
+    mask = df[x_col].notna() & df[y_col].notna()
+    x_series = df[x_col].astype(str)
+    y_series = df[y_col].astype(str)
+    top_x = x_series[mask].value_counts().head(8).index.tolist()
+    top_y = y_series[mask].value_counts().head(8).index.tolist()
+
+    sub_mask = mask & x_series.isin(top_x) & y_series.isin(top_y)
+    if not sub_mask.any():
+        raise ValueError("No overlapping data for categorical analysis.")
+
+    ct = pd.crosstab(x_series[sub_mask], y_series[sub_mask])
+    crosstab_data = {str(idx): {str(c): int(v) for c, v in row.items()} for idx, row in ct.iterrows()}
+
+    return {
+        "analysis_type": "cat_cat",
+        "correlation": None,
+        "regression": None,
+        "scatter_data": None,
+        "box_data": None,
+        "crosstab_data": crosstab_data,
+        "crosstab_columns": [str(c) for c in ct.columns],
     }
 
 
@@ -270,14 +401,36 @@ def get_relationship(df: pd.DataFrame, x_col: str, y_col: str) -> dict[str, Any]
 # Data preview
 # ---------------------------------------------------------------------------
 
-def get_head_tail_sample(df: pd.DataFrame) -> dict[str, Any]:
+def get_head_tail_sample(df: pd.DataFrame, randomize: bool = False) -> dict[str, Any]:
+    import random as _random
     sample_n = min(10, len(df))
+    random_state = _random.randint(0, 99999) if randomize else 42
     return {
         "head": _records(df.head(10)),
         "tail": _records(df.tail(10)),
-        "sample": _records(df.sample(n=sample_n, random_state=42)),
+        "sample": _records(df.sample(n=sample_n, random_state=random_state)),
         "columns": [str(c) for c in df.columns],
     }
+
+
+def get_dataframe_info(df: pd.DataFrame) -> dict[str, Any]:
+    null_counts = df.isnull().sum()
+    info = [
+        {
+            "column": str(col),
+            "dtype": str(df[col].dtype),
+            "non_null_count": int(df[col].notna().sum()),
+            "null_count": int(null_counts[col]),
+        }
+        for col in df.columns
+    ]
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    describe: dict[str, dict[str, Any]] = {}
+    if numeric_cols:
+        desc = df[numeric_cols].describe().round(4)
+        for col in desc.columns:
+            describe[str(col)] = {str(k): _jv(v) for k, v in desc[col].items()}
+    return {"info": info, "describe": describe}
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +492,8 @@ def apply_transforms(
 CLEAN_ACTIONS = (
     "drop_duplicates", "drop_missing_rows", "drop_column",
     "impute_mean", "impute_median", "impute_mode", "ffill", "bfill",
-    "remove_iqr_outliers", "log_transform", "sqrt_transform",
+    "remove_iqr_outliers", "remove_zscore_outliers", "remove_negative_outliers",
+    "remove_date_outliers", "log_transform", "sqrt_transform",
 )
 
 
@@ -377,6 +531,35 @@ def apply_cleaning(df: pd.DataFrame, action: str, column: str | None = None) -> 
         q1, q3 = numeric.quantile(0.25), numeric.quantile(0.75)
         iqr = q3 - q1
         result = result[(numeric >= q1 - 1.5 * iqr) & (numeric <= q3 + 1.5 * iqr)].reset_index(drop=True)
+    elif action == "remove_zscore_outliers":
+        numeric = pd.to_numeric(result[column], errors="coerce")
+        mean_val = float(numeric.mean())
+        std_val = float(numeric.std(ddof=0))
+        if std_val > 0:
+            z_scores = (numeric - mean_val) / std_val
+            result = result[(z_scores.abs() <= 3.0) | numeric.isna()].reset_index(drop=True)
+    elif action == "remove_negative_outliers":
+        numeric = pd.to_numeric(result[column], errors="coerce")
+        result = result[(numeric >= 0) | numeric.isna()].reset_index(drop=True)
+    elif action == "remove_date_outliers":
+        dt = pd.to_datetime(result[column], errors="coerce")
+        try:
+            dt_utc = dt.dt.tz_convert(None) if (hasattr(dt.dt, "tz") and dt.dt.tz is not None) else dt
+            ts = dt_utc.astype("int64")
+        except (TypeError, ValueError, AttributeError):
+            pass
+        else:
+            valid_mask = dt.notna()
+            valid_ts = ts[valid_mask]
+            if len(valid_ts) >= 4:
+                q1_ts = float(valid_ts.quantile(0.25))
+                q3_ts = float(valid_ts.quantile(0.75))
+                iqr_ts = q3_ts - q1_ts
+                if iqr_ts > 0:
+                    lower = q1_ts - 1.5 * iqr_ts
+                    upper = q3_ts + 1.5 * iqr_ts
+                    keep = (~valid_mask) | ((ts >= lower) & (ts <= upper))
+                    result = result[keep].reset_index(drop=True)
     elif action == "log_transform":
         numeric = pd.to_numeric(result[column], errors="coerce")
         result[f"{column}_log"] = np.log(numeric.where(numeric > 0))
@@ -441,6 +624,78 @@ def _validate_ast(tree: ast.AST, columns: set[str]) -> None:
         if isinstance(node, ast.Attribute):
             if node.attr.startswith("_") or node.attr in _BLOCKED_ATTRS:
                 raise ValueError(f"Unsafe attribute: {node.attr}")
+
+
+# ---------------------------------------------------------------------------
+# Advanced imputation
+# ---------------------------------------------------------------------------
+
+VALID_IMPUTE_STRATEGIES = {"mean", "median", "mode", "constant", "ffill", "bfill"}
+
+
+def impute_advanced(
+    df: pd.DataFrame,
+    column: str,
+    strategy: str,
+    constant_value: str | None = None,
+    group_by: str | None = None,
+    sort_by: str | None = None,
+) -> pd.DataFrame:
+    if column not in df.columns:
+        raise ValueError(f"Column not found: {column}")
+    if strategy not in VALID_IMPUTE_STRATEGIES:
+        raise ValueError(f"Unknown strategy: {strategy}. Must be one of {sorted(VALID_IMPUTE_STRATEGIES)}")
+
+    result = df.copy()
+
+    if strategy in ("ffill", "bfill") and sort_by:
+        if sort_by not in result.columns:
+            raise ValueError(f"Sort column not found: {sort_by}")
+        result = result.sort_values(sort_by).reset_index(drop=True)
+
+    if group_by and group_by in result.columns:
+        if strategy == "mean":
+            result[column] = result.groupby(group_by)[column].transform(
+                lambda x: x.fillna(pd.to_numeric(x, errors="coerce").mean())
+            )
+        elif strategy == "median":
+            result[column] = result.groupby(group_by)[column].transform(
+                lambda x: x.fillna(pd.to_numeric(x, errors="coerce").median())
+            )
+        elif strategy == "mode":
+            result[column] = result.groupby(group_by)[column].transform(
+                lambda x: x.fillna(x.mode().iloc[0] if len(x.mode()) > 0 else x)
+            )
+        elif strategy == "ffill":
+            result[column] = result.groupby(group_by)[column].transform(lambda x: x.ffill())
+        elif strategy == "bfill":
+            result[column] = result.groupby(group_by)[column].transform(lambda x: x.bfill())
+        elif strategy == "constant":
+            result[column] = result[column].fillna(constant_value)
+    else:
+        if strategy == "mean":
+            result[column] = result[column].fillna(pd.to_numeric(result[column], errors="coerce").mean())
+        elif strategy == "median":
+            result[column] = result[column].fillna(pd.to_numeric(result[column], errors="coerce").median())
+        elif strategy == "mode":
+            mode = result[column].mode(dropna=True)
+            if not mode.empty:
+                result[column] = result[column].fillna(mode.iloc[0])
+        elif strategy == "constant":
+            result[column] = result[column].fillna(constant_value)
+        elif strategy == "ffill":
+            result[column] = result[column].ffill()
+        elif strategy == "bfill":
+            result[column] = result[column].bfill()
+
+    return result
+
+
+def drop_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"Columns not found: {missing}")
+    return df.drop(columns=columns)
 
 
 # ---------------------------------------------------------------------------

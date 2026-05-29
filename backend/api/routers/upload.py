@@ -6,7 +6,7 @@ import pandas as pd
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from api.models.schemas import ColumnSchema, Metadata, UploadResponse
-from api.services import eda_engine, session
+from api.services import eda_engine, workspace as workspace_svc
 
 router = APIRouter()
 
@@ -27,12 +27,14 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not parse CSV: {exc}") from exc
 
-    session_id = session.create_session(df)
+    workspace_id, dataset_id = workspace_svc.create_workspace(df, file.filename or "dataset.csv")
     metadata = eda_engine.get_metadata(df, file_size_bytes=len(raw))
     schema = eda_engine.get_schema(df)
 
     return UploadResponse(
-        session_id=session_id,
+        session_id=dataset_id,
+        workspace_id=workspace_id,
+        dataset_id=dataset_id,
         metadata=Metadata(**metadata),
         schema_=[ColumnSchema(**col) for col in schema],
     )

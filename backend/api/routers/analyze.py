@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from api.models.schemas import PreviewResponse, RelationshipResponse
+from api.models.schemas import PreviewResponse, RelationshipResponse, SchemaResponse, ColumnSchema
 from api.services import eda_engine, session as session_svc
 
 router = APIRouter()
@@ -26,7 +26,17 @@ async def relationship(session_id: str, x_column: str, y_column: str):
 
 
 @router.get("/data/preview", response_model=PreviewResponse)
-async def data_preview(session_id: str):
+async def data_preview(session_id: str, randomize: bool = False):
     df = _load(session_id)
-    result = eda_engine.get_head_tail_sample(df)
+    result = eda_engine.get_head_tail_sample(df, randomize=randomize)
     return PreviewResponse(**result)
+
+
+@router.get("/data/schema", response_model=SchemaResponse)
+async def data_schema(session_id: str):
+    df = _load(session_id)
+    schema = eda_engine.get_schema(df)
+    return SchemaResponse(
+        columns=[str(c) for c in df.columns],
+        schema_=[ColumnSchema(**col) for col in schema],
+    )

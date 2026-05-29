@@ -18,12 +18,45 @@ class Metadata(BaseModel):
 
 
 class UploadResponse(BaseModel):
-    session_id: str
+    session_id: str       # = dataset_id; kept for compat
+    workspace_id: str
+    dataset_id: str
     metadata: Metadata
     schema_: list[ColumnSchema]
 
     class Config:
         populate_by_name = True
+
+
+class WorkspaceDataset(BaseModel):
+    dataset_id: str
+    name: str
+    rows: int
+    columns: int
+
+
+class WorkspaceMeta(BaseModel):
+    workspace_id: str
+    datasets: list[WorkspaceDataset]
+    active_dataset_id: str
+
+
+class AddDatasetResponse(BaseModel):
+    workspace_id: str
+    dataset_id: str
+    name: str
+    rows: int
+    columns: int
+
+
+class SchemaResponse(BaseModel):
+    columns: list[str]
+    schema_: list[ColumnSchema]
+
+
+class ShapeResponse(BaseModel):
+    rows: int
+    columns: int
 
 
 class SuggestRequest(BaseModel):
@@ -54,6 +87,45 @@ class ApplyResponse(BaseModel):
     success: bool
 
 
+class ImputeRequest(BaseModel):
+    workspace_id: str | None = None
+    dataset_id: str
+    column: str
+    strategy: str   # mean | median | mode | constant | ffill | bfill
+    constant_value: str | None = None
+    group_by: str | None = None
+    sort_by: str | None = None
+
+
+class DropColumnsRequest(BaseModel):
+    workspace_id: str | None = None
+    dataset_id: str
+    columns: list[str]
+
+
+class MutateRequest(BaseModel):
+    workspace_id: str | None = None
+    dataset_id: str
+    column_name: str
+    expression: str
+
+
+class WorkspaceJoinRequest(BaseModel):
+    workspace_id: str
+    left_dataset_id: str
+    right_dataset_id: str
+    join_type: str = "inner"   # inner | left | outer
+    left_key: str
+    right_key: str
+
+
+class WorkspaceJoinResponse(BaseModel):
+    workspace_id: str
+    new_dataset_id: str
+    rows: int
+    columns: int
+
+
 class GlobalProfileResponse(BaseModel):
     duplicate_rows: int
     correlation_matrix: dict[str, dict[str, Any]]
@@ -68,14 +140,27 @@ class ColumnProfileResponse(BaseModel):
     unique: int
     stats: dict[str, Any] | None = None
     distribution_data: list[dict[str, Any]] | None = None
+    is_discrete: bool | None = None
     frequency_data: list[dict[str, Any]] | None = None
+    frequency_data_weekly: list[dict[str, Any]] | None = None
+    frequency_data_monthly: list[dict[str, Any]] | None = None
     word_frequency: list[dict[str, Any]] | None = None
+    outlier_stats: dict[str, Any] | None = None
 
 
 class RelationshipResponse(BaseModel):
-    correlation: dict[str, float]
-    regression: dict[str, float]
-    scatter_data: list[dict[str, Any]]
+    analysis_type: str = "cont_cont"
+    correlation: dict[str, float] | None = None
+    regression: dict[str, float] | None = None
+    scatter_data: list[dict[str, Any]] | None = None
+    box_data: list[dict[str, Any]] | None = None
+    crosstab_data: dict[str, dict[str, Any]] | None = None
+    crosstab_columns: list[str] | None = None
+
+
+class DataframeInfoResponse(BaseModel):
+    info: list[dict[str, Any]]
+    describe: dict[str, dict[str, Any]]
 
 
 class PreviewResponse(BaseModel):
