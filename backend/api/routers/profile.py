@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from api.models.schemas import ColumnProfileResponse, GlobalProfileResponse
+from api.models.schemas import ColumnProfileResponse, DataframeInfoResponse, GlobalProfileResponse
 from api.services import eda_engine, session as session_svc
 
 router = APIRouter()
@@ -30,3 +30,10 @@ async def column_profile(session_id: str, column_name: str):
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return ColumnProfileResponse(**result)
+
+
+@router.get("/profile/dataframe-info", response_model=DataframeInfoResponse)
+async def dataframe_info(session_id: str):
+    df = _load(session_id)
+    result = eda_engine.get_dataframe_info(df)
+    return DataframeInfoResponse(**result)

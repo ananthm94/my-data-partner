@@ -12,18 +12,45 @@ import {
 } from "@/lib/api";
 
 interface SessionData {
+  workspace_id: string;
+  dataset_id: string;
   session_id: string;
   metadata: Metadata;
   schema_: ColumnSchema[];
 }
 
+interface ColEdit {
+  name: string;
+  type: string;
+}
+
+const TYPE_OPTIONS = [
+  { value: "text", label: "String" },
+  { value: "numeric", label: "Integer" },
+  { value: "float", label: "Float" },
+  { value: "boolean", label: "Boolean" },
+  { value: "datetime", label: "Datetime" },
+  { value: "categorical", label: "Categorical" },
+];
+
+const UI_TYPE_TO_PANDAS: Record<string, string> = {
+  text: "object",
+  numeric: "int64",
+  float: "float64",
+  boolean: "boolean",
+  datetime: "datetime64[ns]",
+  categorical: "category",
+};
+
 function UploadWizardInner() {
   const params = useSearchParams();
   const router = useRouter();
-  const sessionId = params.get("session") ?? "";
+  const workspaceId = params.get("workspace") ?? "";
+  const datasetId = params.get("dataset") ?? params.get("session") ?? "";
 
   const [step, setStep] = useState<1 | 2>(1);
   const [sessionData, setSessionData] = useState<SessionData | null>(null);
+  const [columnEdits, setColumnEdits] = useState<Record<string, ColEdit>>({});
   const [context, setContext] = useState("");
   const [loadingSuggest, setLoadingSuggest] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestions | null>(null);
@@ -33,32 +60,64 @@ function UploadWizardInner() {
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Fetch session info from the backend
   useEffect(() => {
-    if (!sessionId) return;
-    // We already have metadata from the upload response, stored in sessionStorage
-    const raw = sessionStorage.getItem(`session_${sessionId}`);
+    if (!workspaceId && !datasetId) return;
+
+    // Try new workspace key first, fall back to old session key
+    const storageKey = workspaceId
+      ? `workspace_${workspaceId}`
+      : `session_${datasetId}`;
+    const raw = sessionStorage.getItem(storageKey);
+
     if (raw) {
-      setSessionData(JSON.parse(raw));
+      const data = JSON.parse(raw);
+      // Normalize to SessionData shape
+      const normalized: SessionData = {
+        workspace_id: data.workspace_id ?? workspaceId,
+        dataset_id: data.dataset_id ?? data.session_id ?? datasetId,
+        session_id: data.session_id ?? data.dataset_id ?? datasetId,
+        metadata: data.metadata,
+        schema_: data.schema_,
+      };
+      setSessionData(normalized);
+      const edits: Record<string, ColEdit> = {};
+      normalized.schema_.forEach((col) => {
+        edits[col.column_name] = { name: col.column_name, type: col.inferred_type };
+      });
+      setColumnEdits(edits);
     } else {
       setError("Session data not found. Please upload again.");
     }
-  }, [sessionId]);
+  }, [workspaceId, datasetId]);
 
-  // Store upload response in sessionStorage from landing page
-  // (We pass it via sessionStorage since Next.js router doesn't carry state)
-  // The landing page sets this before navigating.
+  const effectiveDatasetId = sessionData?.dataset_id ?? datasetId;
+  const effectiveWorkspaceId = sessionData?.workspace_id ?? workspaceId;
+
+  const buildManualTransforms = (schema: ColumnSchema[]) => {
+    const renames: Record<string, string> = {};
+    const type_casts: Record<string, string> = {};
+    schema.forEach((col) => {
+      const edit = columnEdits[col.column_name];
+      if (!edit) return;
+      if (edit.name !== col.column_name) {
+        renames[col.column_name] = edit.name;
+      }
+      if (edit.type !== col.inferred_type && UI_TYPE_TO_PANDAS[edit.type]) {
+        type_casts[col.column_name] = UI_TYPE_TO_PANDAS[edit.type];
+      }
+    });
+    return { renames, type_casts };
+  };
 
   const handleSuggest = async () => {
-    if (!sessionId) return;
+    if (!effectiveDatasetId) return;
     setLoadingSuggest(true);
     setError(null);
     try {
-      const res = await suggestTransforms(sessionId, context);
+      const res = await suggestTransforms(effectiveDatasetId, context);
       setAiAvailable(res.ai_available);
       setAiMessage(res.message ?? null);
       setSuggestions(res.suggestions);
-      // Pre-accept all suggestions
       const acc: Record<string, boolean> = {};
       const allKeys = [
         ...Object.keys(res.suggestions.renames).map((k) => `rename:${k}`),
@@ -75,15 +134,31 @@ function UploadWizardInner() {
     }
   };
 
-  const skipToDashboard = () => router.push(`/dashboard/${sessionId}`);
+  const skipToDashboard = async () => {
+    if (!sessionData) return router.push(`/dashboard/${effectiveWorkspaceId}`);
+    const { renames, type_casts } = buildManualTransforms(sessionData.schema_);
+    if (Object.keys(renames).length > 0 || Object.keys(type_casts).length > 0) {
+      setApplying(true);
+      try {
+        await applyTransforms(effectiveDatasetId, renames, type_casts, {});
+      } catch {
+        // Non-fatal
+      } finally {
+        setApplying(false);
+      }
+    }
+    router.push(`/dashboard/${effectiveWorkspaceId}`);
+  };
 
   const handleConfirm = async () => {
-    if (!suggestions || !sessionId) return;
+    if (!suggestions || !effectiveDatasetId || !sessionData) return;
     setApplying(true);
     setError(null);
     try {
-      const renames: Record<string, string> = {};
-      const type_casts: Record<string, string> = {};
+      const { renames: manualRenames, type_casts: manualTypeCasts } = buildManualTransforms(sessionData.schema_);
+
+      const renames: Record<string, string> = { ...manualRenames };
+      const type_casts: Record<string, string> = { ...manualTypeCasts };
       const imputations: Record<string, string> = {};
 
       Object.entries(suggestions.renames).forEach(([k, v]) => {
@@ -96,8 +171,8 @@ function UploadWizardInner() {
         if (accepted[`impute:${k}`]) imputations[k] = v;
       });
 
-      await applyTransforms(sessionId, renames, type_casts, imputations);
-      router.push(`/dashboard/${sessionId}`);
+      await applyTransforms(effectiveDatasetId, renames, type_casts, imputations);
+      router.push(`/dashboard/${effectiveWorkspaceId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to apply transforms");
       setApplying(false);
@@ -106,6 +181,18 @@ function UploadWizardInner() {
 
   const toggle = (key: string) =>
     setAccepted((prev) => ({ ...prev, [key]: !prev[key] }));
+
+  const updateColName = (original: string, newName: string) =>
+    setColumnEdits((prev) => ({
+      ...prev,
+      [original]: { ...prev[original], name: newName },
+    }));
+
+  const updateColType = (original: string, newType: string) =>
+    setColumnEdits((prev) => ({
+      ...prev,
+      [original]: { ...prev[original], type: newType },
+    }));
 
   if (!sessionData && !error) {
     return (
@@ -148,7 +235,6 @@ function UploadWizardInner() {
         {/* Step 1 */}
         {step === 1 && (
           <div className="space-y-6">
-            {/* Metadata cards */}
             <div className="grid grid-cols-3 gap-4">
               {[
                 { label: "Total Rows", value: meta.total_rows.toLocaleString() },
@@ -162,46 +248,67 @@ function UploadWizardInner() {
               ))}
             </div>
 
-            {/* Schema table */}
             <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-              <div className="px-4 py-3 border-b border-slate-100 font-semibold text-slate-700 text-sm">
-                Column Schema
+              <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
+                <span className="font-semibold text-slate-700 text-sm">Column Schema</span>
+                <span className="text-xs text-slate-400">Edit names and types below</span>
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead className="bg-slate-50 text-slate-500 uppercase text-xs">
                     <tr>
-                      <th className="px-4 py-2 text-left">Column</th>
-                      <th className="px-4 py-2 text-left">Inferred Type</th>
+                      <th className="px-4 py-2 text-left">Column Name</th>
+                      <th className="px-4 py-2 text-left">Data Type</th>
                       <th className="px-4 py-2 text-right">Completeness</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {schema.map((col) => (
-                      <tr key={col.column_name} className="hover:bg-slate-50">
-                        <td className="px-4 py-2 font-mono text-slate-700">{col.column_name}</td>
-                        <td className="px-4 py-2 text-slate-500">{col.inferred_type}</td>
-                        <td className="px-4 py-2 text-right">
-                          <span
-                            className={`font-medium ${
-                              col.completeness_pct === 100
-                                ? "text-green-600"
-                                : col.completeness_pct >= 80
-                                ? "text-yellow-600"
-                                : "text-red-500"
-                            }`}
-                          >
-                            {col.completeness_pct}%
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
+                    {schema.map((col) => {
+                      const edit = columnEdits[col.column_name] ?? { name: col.column_name, type: col.inferred_type };
+                      return (
+                        <tr key={col.column_name} className="hover:bg-slate-50">
+                          <td className="px-4 py-2">
+                            <input
+                              type="text"
+                              value={edit.name}
+                              onChange={(e) => updateColName(col.column_name, e.target.value)}
+                              className="w-full font-mono text-slate-700 bg-transparent border border-transparent rounded px-1 py-0.5 focus:border-blue-400 focus:bg-white focus:outline-none transition-colors"
+                            />
+                          </td>
+                          <td className="px-4 py-2">
+                            <select
+                              value={edit.type}
+                              onChange={(e) => updateColType(col.column_name, e.target.value)}
+                              className="text-xs border border-slate-200 rounded-md px-2 py-1 bg-white text-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                            >
+                              {TYPE_OPTIONS.map((opt) => (
+                                <option key={opt.value} value={opt.value}>
+                                  {opt.label}
+                                </option>
+                              ))}
+                            </select>
+                          </td>
+                          <td className="px-4 py-2 text-right">
+                            <span
+                              className={`font-medium ${
+                                col.completeness_pct === 100
+                                  ? "text-green-600"
+                                  : col.completeness_pct >= 80
+                                  ? "text-yellow-600"
+                                  : "text-red-500"
+                              }`}
+                            >
+                              {col.completeness_pct}%
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
             </div>
 
-            {/* Context textarea */}
             <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 space-y-2">
               <label className="font-semibold text-slate-700 text-sm block">
                 Business Context (optional)
@@ -225,10 +332,11 @@ function UploadWizardInner() {
               </button>
               <button
                 onClick={skipToDashboard}
-                className="px-5 py-3 border border-slate-300 text-slate-600 rounded-xl font-medium hover:bg-slate-50 transition-colors"
-                title="Skip AI suggestions and go straight to the dashboard"
+                disabled={applying}
+                className="px-5 py-3 border border-slate-300 text-slate-600 rounded-xl font-medium hover:bg-slate-50 transition-colors disabled:opacity-60"
+                title="Apply manual edits and go to the dashboard"
               >
-                Skip →
+                {applying ? "Applying…" : "Continue →"}
               </button>
             </div>
           </div>
@@ -254,7 +362,6 @@ function UploadWizardInner() {
                   : "No suggestions available"}
               </div>
               <div className="divide-y divide-slate-100">
-                {/* Renames */}
                 {Object.entries(suggestions.renames).map(([old, newName]) => (
                   <SuggestionRow
                     key={`rename:${old}`}
@@ -265,7 +372,6 @@ function UploadWizardInner() {
                     onToggle={() => toggle(`rename:${old}`)}
                   />
                 ))}
-                {/* Type casts */}
                 {Object.entries(suggestions.type_casts).map(([col, type]) => (
                   <SuggestionRow
                     key={`type:${col}`}
@@ -276,7 +382,6 @@ function UploadWizardInner() {
                     onToggle={() => toggle(`type:${col}`)}
                   />
                 ))}
-                {/* Imputations */}
                 {Object.entries(suggestions.imputations).map(([col, strategy]) => (
                   <SuggestionRow
                     key={`impute:${col}`}
@@ -315,7 +420,6 @@ function UploadWizardInner() {
           </div>
         )}
 
-        {/* Loading skeleton for step 2 */}
         {step === 2 && !suggestions && loadingSuggest && (
           <div className="space-y-3 animate-pulse">
             {[1, 2, 3, 4].map((i) => (
