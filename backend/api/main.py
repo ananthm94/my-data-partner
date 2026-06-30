@@ -15,7 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import analyze, clean, custom, join, profile, transform, upload, workspace
+from api.routers import analytics, analyze, clean, custom, join, profile, transform, upload, workspace
 from api.services.session import cleanup_old_sessions
 
 
@@ -39,5 +39,5 @@ app.add_middleware(
 )
 
 API_PREFIX = "/api"
-for router_module in (upload, transform, profile, analyze, join, custom, clean, workspace):
+for router_module in (upload, transform, profile, analyze, join, custom, clean, workspace, analytics):
     app.include_router(router_module.router, prefix=API_PREFIX)

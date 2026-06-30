@@ -324,3 +324,100 @@ export function applyClean(
 ): Promise<CleanResult> {
   return request("POST", "/clean", { session_id, action, column });
 }
+
+// ---- Analytics Pipeline API -------------------------------------------------
+
+export interface AnalyticsColumnInfo {
+  name: string;
+  type: string;
+}
+
+export interface AnalyticsTableInfo {
+  name: string;
+  row_count: number;
+  columns: AnalyticsColumnInfo[];
+}
+
+export interface AnalyticsPipelineState {
+  current_step: number;
+  tables: AnalyticsTableInfo[];
+  sources_yaml: string;
+  sources_status: string;
+  staging_models: Record<string, string>;
+  staging_status: string;
+  staging_dbt_log: string;
+  semantic_layer: Record<string, unknown>;
+  semantic_status: string;
+  messages: Array<{ role: string; content: string }>;
+  error: string | null;
+}
+
+export interface AnalyticsChartSpec {
+  chart_type: "bar" | "line" | "pie" | "horizontal_bar";
+  title: string;
+  x_key: string;
+  y_key: string;
+  data: Record<string, unknown>[];
+}
+
+export interface AnalyticsChatResponse {
+  response: string;
+  sql?: string | null;
+  data?: Record<string, unknown>[] | null;
+  chart?: AnalyticsChartSpec | null;
+  error?: string | null;
+}
+
+export function configureAnalytics(config: {
+  llm_provider: string;
+  llm_api_key: string;
+  llm_model?: string | null;
+}): Promise<{ status: string; provider: string }> {
+  return request("POST", "/analytics/configure", config);
+}
+
+export function uploadAnalyticsFiles(files: File[]): Promise<{ tables: AnalyticsTableInfo[] }> {
+  const form = new FormData();
+  for (const f of files) form.append("files", f);
+  return request("POST", "/analytics/upload", form, true);
+}
+
+export function generateSources(): Promise<{ sources_yaml: string; status: string; error?: string | null }> {
+  return request("POST", "/analytics/generate-sources");
+}
+
+export function generateStaging(): Promise<{ staging_models: Record<string, string>; dbt_log: string; status: string; error?: string | null }> {
+  return request("POST", "/analytics/generate-staging");
+}
+
+export function generateSemantic(): Promise<{ semantic_layer: Record<string, unknown>; status: string; error?: string | null }> {
+  return request("POST", "/analytics/generate-semantic");
+}
+
+export function sendAnalyticsChat(message: string): Promise<AnalyticsChatResponse> {
+  return request("POST", "/analytics/chat", { message });
+}
+
+export function getAnalyticsState(): Promise<AnalyticsPipelineState> {
+  return request("GET", "/analytics/state");
+}
+
+export function getAnalyticsArtifacts(type: string): Promise<{ content: string | null }> {
+  return request("GET", `/analytics/artifacts/${type}`);
+}
+
+export function resetAnalytics(): Promise<{ status: string }> {
+  return request("POST", "/analytics/reset");
+}
+
+export function getAnalyticsTables(): Promise<AnalyticsTableInfo[]> {
+  return request("GET", "/analytics/tables");
+}
+
+export function getAnalyticsProviders(): Promise<Array<{ id: string; default_model: string }>> {
+  return request("GET", "/analytics/providers");
+}
+
+export function getAnalyticsSystemPrompt(): Promise<{ system_prompt: string }> {
+  return request("GET", "/analytics/system-prompt");
+}

@@ -32,30 +32,6 @@ const UI_TYPE_TO_PANDAS: Record<string, string> = {
   categorical: "category",
 };
 
-function CollapsibleSection({
-  title,
-  defaultOpen,
-  children,
-}: {
-  title: string;
-  defaultOpen: boolean;
-  children: React.ReactNode;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="w-full px-4 py-3 flex items-center justify-between text-sm font-semibold text-slate-700 hover:bg-slate-50 transition-colors"
-      >
-        <span>{title}</span>
-        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-      </button>
-      {open && <div className="border-t border-slate-100">{children}</div>}
-    </div>
-  );
-}
-
 function DataTable({
   title,
   defaultOpen,
