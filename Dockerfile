@@ -32,6 +32,8 @@ COPY --from=frontend-build /app/frontend/public ./frontend/public
 # Config files
 COPY nginx.conf ./nginx.conf
 COPY supervisord.conf ./supervisord.conf
+COPY start.sh ./start.sh
+RUN chmod +x /app/start.sh
 
 # Data directory (mount a volume here for persistence)
 RUN mkdir -p /app/data
@@ -39,4 +41,4 @@ ENV DATA_DIR=/app/data
 
 EXPOSE 8000
 
-CMD ["supervisord", "-c", "/app/supervisord.conf"]
+CMD ["/app/start.sh"]
